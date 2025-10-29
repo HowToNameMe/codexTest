@@ -22,7 +22,7 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 try:
     import requests
@@ -32,6 +32,14 @@ except ImportError:  # pragma: no cover
 
 RANKING_URL = "https://api.bilibili.com/x/web-interface/ranking/v2"
 POPULAR_URL = "https://api.bilibili.com/x/web-interface/popular"
+REQUEST_TIMEOUT = 15
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124 Safari/537.36"
+    ),
+    "Referer": "https://www.bilibili.com/",
+}
 
 
 @dataclass
@@ -60,27 +68,34 @@ def _ensure_requests():
         sys.exit(2)
 
 
-def get_top_from_ranking(session: requests.Session) -> Optional[Video]:
-    # rid=0 (all), type=all, day=1 (today)
-    params = {"rid": 0, "type": "all", "day": 1}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-        " AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-        "Referer": "https://www.bilibili.com/",
-    }
-    resp = session.get(RANKING_URL, params=params, headers=headers, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    lst = (
-        data.get("data", {})
-        .get("list", {})
-        .get("list", [])
+def _fetch_json(
+    session: requests.Session,
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Perform a GET request and return the decoded JSON payload."""
+    resp = session.get(
+        url,
+        params=params,
+        headers=DEFAULT_HEADERS,
+        timeout=REQUEST_TIMEOUT,
     )
-    if not lst:
-        return None
-    item = lst[0]
-    stat = item.get("stat", {})
-    owner = item.get("owner", {})
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _first_dict(items: Iterable[Any]) -> Optional[Dict[str, Any]]:
+    """Return the first mapping in an iterable, or None if absent."""
+    for item in items:
+        if isinstance(item, dict):
+            return item
+        break
+    return None
+
+
+def _video_from_payload(item: Dict[str, Any]) -> Video:
+    stat = item.get("stat") or {}
+    owner = item.get("owner") or {}
     bvid = item.get("bvid") or ""
     url = f"https://www.bilibili.com/video/{bvid}" if bvid else ""
     return Video(
@@ -100,42 +115,30 @@ def get_top_from_ranking(session: requests.Session) -> Optional[Video]:
     )
 
 
+def get_top_from_ranking(session: requests.Session) -> Optional[Video]:
+    # rid=0 (all), type=all, day=1 (today)
+    params = {"rid": 0, "type": "all", "day": 1}
+    data = _fetch_json(session, RANKING_URL, params)
+    nested = data.get("data", {}).get("list", {}).get("list")
+    if not isinstance(nested, list):
+        return None
+    item = _first_dict(nested)
+    if item is None:
+        return None
+    return _video_from_payload(item)
+
+
 def get_top_from_popular(session: requests.Session) -> Optional[Video]:
     # popular feed defaults to hot videos now
     params = {"ps": 20, "pn": 1}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-        " AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-        "Referer": "https://www.bilibili.com/",
-    }
-    resp = session.get(POPULAR_URL, params=params, headers=headers, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    lst = data.get("data", {}).get("list", [])
-    if not lst:
+    data = _fetch_json(session, POPULAR_URL, params)
+    lst = data.get("data", {}).get("list")
+    if not isinstance(lst, list):
         return None
-    # Choose the first item; alternatively, pick by max views if present
-    first = lst[0]
-    # Some fields differ slightly from ranking structure
-    stat = first.get("stat", {})
-    owner = first.get("owner", {})
-    bvid = first.get("bvid") or ""
-    url = f"https://www.bilibili.com/video/{bvid}" if bvid else ""
-    return Video(
-        title=first.get("title", ""),
-        bvid=bvid,
-        aid=first.get("aid"),
-        author=owner.get("name", ""),
-        author_mid=owner.get("mid"),
-        view=stat.get("view"),
-        like=stat.get("like"),
-        coin=stat.get("coin"),
-        favorite=stat.get("favorite"),
-        share=stat.get("share"),
-        danmaku=stat.get("danmaku"),
-        duration=first.get("duration"),
-        url=url,
-    )
+    item = _first_dict(lst)
+    if item is None:
+        return None
+    return _video_from_payload(item)
 
 
 def pick_source(session: requests.Session, source: str) -> Optional[Video]:
@@ -149,19 +152,23 @@ def pick_source(session: requests.Session, source: str) -> Optional[Video]:
         v = get_top_from_ranking(session)
         if v:
             return v
-    except Exception:
-        pass
+    except requests.RequestException as exc:
+        print(f"Ranking source failed ({exc}); falling back to popular.", file=sys.stderr)
     return get_top_from_popular(session)
 
 
 def human_number(n: Optional[int]) -> str:
     if n is None:
         return "-"
-    for unit in ["", "K", "M", "B"]:
-        if abs(n) < 1000:
-            return f"{n}{unit}"
-        n //= 1000
-    return f"{n}T"
+    num = float(n)
+    for unit in ("", "K", "M", "B"):
+        if abs(num) < 1000:
+            break
+        num /= 1000
+    else:
+        unit = "T"
+    formatted = f"{num:.1f}".rstrip("0").rstrip(".")
+    return f"{formatted}{unit}"
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -180,9 +187,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     _ensure_requests()
-    session = requests.Session()
     try:
-        video = pick_source(session, args.source)
+        with requests.Session() as session:
+            video = pick_source(session, args.source)
     except requests.RequestException as e:
         print(f"Network error: {e}", file=sys.stderr)
         return 1
@@ -196,9 +203,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Human-readable summary
     print("Hottest video today")
-    print("- Title: ", video.title)
-    print("- Author:", video.author)
-    print("- URL:   ", video.url)
+    print(f"- Title:  {video.title}")
+    print(f"- Author: {video.author}")
+    print(f"- URL:    {video.url}")
     print(
         "- Stats: ",
         f"views {human_number(video.view)},",
@@ -222,4 +229,3 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
